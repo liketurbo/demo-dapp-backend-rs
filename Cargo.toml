@@ -1,5 +1,5 @@
 [package]
-name = "duckknow-server"
+name = "demo-dapp-backend-rs"
 version = "0.1.0"
 edition = "2021"
 

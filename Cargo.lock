@@ -325,6 +325,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-dapp-backend-rs"
+version = "0.1.0"
+dependencies = [
+ "base64 0.21.2",
+ "ed25519-dalek",
+ "hex",
+ "hmac",
+ "jwt",
+ "rand 0.8.5",
+ "rocket",
+ "sha2 0.10.7",
+ "tonlib",
+]
+
+[[package]]
 name = "devise"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -375,21 +390,6 @@ dependencies = [
  "block-buffer 0.10.4",
  "crypto-common",
  "subtle",
-]
-
-[[package]]
-name = "duckknow-server"
-version = "0.1.0"
-dependencies = [
- "base64 0.21.2",
- "ed25519-dalek",
- "hex",
- "hmac",
- "jwt",
- "rand 0.8.5",
- "rocket",
- "sha2 0.10.7",
- "tonlib",
 ]
 
 [[package]]
