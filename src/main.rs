@@ -1,136 +1,213 @@
-#[macro_use]
-extern crate rocket;
-extern crate base64;
-extern crate ed25519_dalek;
-extern crate jwt;
-extern crate tonlib;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use base64::{engine::general_purpose, Engine as _};
-use ed25519_dalek::{PublicKey, Signature, Verifier};
+use anyhow::anyhow;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use base64::prelude::*;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
-use jwt::{SignWithKey, VerifyWithKey};
-use rocket::serde::{json::Json, Deserialize, Serialize};
-use rocket::{fairing::AdHoc, State};
+use rand::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tonlib::address::TonAddress;
-use tonlib::client::{TonClient, TonClientBuilder, TonConnectionParams};
-use tonlib::config::{MAINNET_CONFIG, TESTNET_CONFIG};
-use tonlib::contract::TonContract;
+use tonlib::{
+    address::TonAddress,
+    client::TonClient,
+    contract::{TonContractFactory, TonContractInterface},
+};
 
-pub mod utils;
+#[tokio::main]
+async fn main() {
+    // initialize tracing
+    tracing_subscriber::fmt::init();
 
-const MAINNET_NETWORK: &'static str = "-239";
-const TESTNET_NETWORK: &'static str = "-3";
-const NETWORKS: [&'static str; 2] = [MAINNET_NETWORK, TESTNET_NETWORK];
+    let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
 
-#[derive(Deserialize)]
-#[serde(crate = "rocket::serde")]
-struct Config {
-    secret: String,
-    ttl: u64,
-    domain: String,
-}
-
-#[derive(Deserialize)]
-#[serde(crate = "rocket::serde")]
-struct TonProof {
-    address: String,
-    /// MAINNET = "-239",
-    /// TESTNET = "-3"
-    network: String,
-    proof: TonProofItem,
-}
-
-#[derive(Deserialize)]
-#[serde(crate = "rocket::serde")]
-struct TonProofItem {
-    domain: TonDomain,
-    payload: String,
-    signature: String,
-    state_init: String,
-    timestamp: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(crate = "rocket::serde")]
-struct TonDomain {
-    #[serde(rename = "lengthBytes")]
-    length_bytes: u64,
-    value: String,
-}
-
-#[derive(Serialize)]
-#[serde(crate = "rocket::serde")]
-struct GeneratePayloadResponse {
-    payload: String,
-}
-
-#[post("/generatePayload")]
-fn generate_payload(config: &State<Config>) -> Result<Json<GeneratePayloadResponse>, String> {
-    let payload = utils::generate_payload(&config.secret, config.ttl)?;
-    Ok(Json(GeneratePayloadResponse { payload }))
-}
-
-const TON_PROOF_PREFIX: &'static str = "ton-proof-item-v2/";
-const TON_CONNECT_PREFIX: &'static str = "ton-connect";
-
-#[derive(Serialize)]
-#[serde(crate = "rocket::serde")]
-struct CheckProofResponse {
-    token: String,
-}
-
-#[post("/checkProof", data = "<body>")]
-async fn check_proof(
-    config: &State<Config>,
-    body: Json<TonProof>,
-) -> Result<Json<CheckProofResponse>, String> {
-    utils::check_payload(&config.secret, &body.proof.payload)
-        .map_err(|e| format!("payload check failed: {}", e))?;
-
-    if !NETWORKS.contains(&body.network.as_str()) {
-        return Err(format!("undefined network: {}", body.network));
-    }
+    const MAINNET_NETWORK: &'static str = "-239";
+    const TESTNET_NETWORK: &'static str = "-3";
 
     TonClient::set_log_verbosity_level(0);
-    let client = TonClientBuilder::new()
-        .with_connection_params(&TonConnectionParams {
-            config: if &body.network == TESTNET_NETWORK {
-                TESTNET_CONFIG.to_string()
-            } else {
-                MAINNET_CONFIG.to_string()
-            },
-            blockchain_name: None,
-            use_callbacks_for_network: false,
-            ignore_cache: false,
-            keystore_dir: None,
-        })
-        .with_pool_size(10)
+    let ton_client_mainnet = TonClient::builder()
+        .with_pool_size(5)
+        .with_config(MAINNET_NETWORK)
         .build()
         .await
-        .map_err(|_| "failed to establishe connection to liteserver")?;
+        .unwrap();
+    let ton_client_testnet = TonClient::builder()
+        .with_pool_size(5)
+        .with_config(TESTNET_NETWORK)
+        .build()
+        .await
+        .unwrap();
+    let ton_mainnet_contract_factory = TonContractFactory::builder(&ton_client_mainnet)
+        .build()
+        .await
+        .unwrap();
+    let ton_testnet_contract_factory = TonContractFactory::builder(&ton_client_testnet)
+        .build()
+        .await
+        .unwrap();
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards 🤷")
-        .as_secs();
-    if now >= body.proof.timestamp + config.ttl {
-        return Err("proof has been expired".to_string());
+    let shared_state = Arc::new(AppState {
+        secret,
+        ttl: 3600, // 1 hour
+        domain: "example.com".to_string(),
+        ton_mainnet_contract_factory,
+        ton_testnet_contract_factory,
+    });
+
+    // build our application with a route
+    let app = Router::new()
+        // `GET /` goes to `root`
+        .route("/", get(root))
+        // `POST /users` goes to `create_user`
+        .route("/users", post(create_user))
+        .route("/generatePayload", post(generate_ton_proof_payload))
+        .route("/checkProof", post(check_ton_proof))
+        .with_state(shared_state);
+
+    // run our app with hyper, listening globally on port 3000
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+// basic handler that responds with a static string
+async fn root() -> &'static str {
+    "Hello, World!"
+}
+
+async fn create_user(
+    // this argument tells axum to parse the request body
+    // as JSON into a `CreateUser` type
+    Json(payload): Json<CreateUser>,
+) -> (StatusCode, Json<User>) {
+    // insert your application logic here
+    let user = User {
+        id: 1337,
+        username: payload.username,
+    };
+
+    // this will be converted into a JSON response
+    // with a status code of `201 Created`
+    (StatusCode::CREATED, Json(user))
+}
+
+// the input to our `create_user` handler
+#[derive(Deserialize)]
+struct CreateUser {
+    username: String,
+}
+
+// the output to our `create_user` handler
+#[derive(Serialize)]
+struct User {
+    id: u64,
+    username: String,
+}
+
+/// Generate ton_proof payload
+///
+/// ```
+/// 0             8                 16               48
+/// | random bits | expiration time | sha2 signature |
+/// 0                                       32
+/// |             payload_hex               |
+/// ```
+async fn generate_ton_proof_payload(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<GenerateTonProofPayload>, AppError> {
+    let mut payload: [u8; 48] = [0; 48];
+    let mut rng = rand::thread_rng();
+    rng.fill(&mut payload[0..8]);
+
+    if let Ok(n) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        let expire = n.as_secs() + state.ttl;
+        let expire_be = expire.to_be_bytes();
+        payload[8..16].copy_from_slice(&expire_be);
+    } else {
+        return Err(anyhow!("time went backwards 🤷").into());
     }
 
-    if body.proof.domain.value != config.domain {
-        return Err(format!("wrong domain: {}", body.proof.domain.value));
+    let mut mac = Hmac::<Sha256>::new_from_slice(state.secret.as_bytes())?;
+    mac.update(&payload[0..16]);
+    let signature = mac.finalize().into_bytes();
+    payload[16..48].copy_from_slice(&signature);
+
+    let hex = hex::encode(&payload[0..32]);
+
+    Ok(Json(GenerateTonProofPayload { payload: hex }))
+}
+
+/// Check ton_proof
+async fn check_ton_proof(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CheckProofPayload>,
+) -> Result<Json<CheckTonProof>, AppError> {
+    let data = hex::decode(body.proof.payload.clone())?;
+
+    if data.len() != 32 {
+        return Err(AppError::BadRequest(anyhow!(
+            "invalid payload length, got {}, expected 32",
+            data.len()
+        )));
     }
 
-    let domain_len = body.proof.domain.value.len();
-    if domain_len != body.proof.domain.length_bytes as usize {
-        return Err(format!("invalid domain length: {}", domain_len));
+    let mut mac = Hmac::<Sha256>::new_from_slice(state.secret.as_bytes())?;
+    mac.update(&data[..16]);
+    let signature_bytes: [u8; 32] = mac.finalize().into_bytes().into();
+    let signature_valid = data
+        .iter()
+        .skip(16)
+        .zip(signature_bytes.iter().take(16))
+        .all(|(a, b)| a == b);
+
+    if signature_valid {
+        return Err(AppError::BadRequest(anyhow!("invalid payload signature")));
     }
 
-    let addr = TonAddress::from_hex_str(&body.address)
-        .map_err(|_| format!("invalid account: {}", body.address))?;
+    let expire_b: [u8; 8] = data[8..16].try_into().expect("already checked length");
+    let expire_d = u64::from_be_bytes(expire_b);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+    // check payload expiration
+    if now > expire_d {
+        return Err(AppError::BadRequest(anyhow!("payload expired")));
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+    // check ton_proof expiration
+    if now > body.proof.timestamp + state.ttl {
+        return Err(AppError::BadRequest(anyhow!("ton_proof has been expired")));
+    }
+
+    if body.proof.domain.value != state.domain {
+        return Err(AppError::BadRequest(anyhow!(
+            "wrong domain, got {}, expected {}",
+            body.proof.domain.value,
+            state.domain
+        )));
+    }
+
+    if body.proof.domain.length_bytes != body.proof.domain.value.len() as u64 {
+        return Err(AppError::BadRequest(anyhow!(
+            "domain length mismatched against provided length_bytes of {}",
+            body.proof.domain.length_bytes
+        )));
+    }
+
+    const TON_PROOF_PREFIX: &'static str = "ton-proof-item-v2/";
+
+    let addr =
+        TonAddress::from_hex_str(&body.address).map_err(|e| AppError::BadRequest(e.into()))?;
 
     let mut msg: Vec<u8> = Vec::new();
     msg.extend_from_slice(TON_PROOF_PREFIX.as_bytes());
@@ -145,6 +222,8 @@ async fn check_proof(
     hasher.update(msg);
     let msg_hash = hasher.finalize();
 
+    const TON_CONNECT_PREFIX: &'static str = "ton-connect";
+
     let mut full_msg: Vec<u8> = vec![0xff, 0xff];
     full_msg.extend_from_slice(TON_CONNECT_PREFIX.as_bytes());
     full_msg.extend_from_slice(&msg_hash);
@@ -153,129 +232,146 @@ async fn check_proof(
     hasher.update(full_msg);
     let full_msg_hash = hasher.finalize();
 
-    let wallet_contract = TonContract::new(&client, &addr);
+    let contract_factory = match body.network {
+        TonNetwork::Mainnet => &state.ton_mainnet_contract_factory,
+        TonNetwork::Testnet => &state.ton_testnet_contract_factory,
+    };
+
+    let wallet_contract = contract_factory.get_contract(&addr);
     let res = wallet_contract
         .run_get_method("get_public_key", &vec![])
-        .await
-        .map_err(|_| "get_public_key method failed")?;
-    let pubkey_n = res
-        .stack
-        .get_biguint(0)
-        .map_err(|_| "get_public_key parsing failed")?;
-    let pubkey = PublicKey::from_bytes(&pubkey_n.to_bytes_be())
-        .map_err(|_| "failed to deserialize pubkey")?;
-
-    let sign_b = general_purpose::STANDARD
+        .await?;
+    let pubkey_n = res.stack.get_biguint(0)?;
+    let pubkey_bytes: [u8; 32] = pubkey_n
+        .to_bytes_be()
+        .try_into()
+        .map_err(|_| anyhow!("failed to extract 32 bits long public from the wallet contract"))?;
+    let pubkey = VerifyingKey::from_bytes(&pubkey_bytes)?;
+    let signature_bytes: [u8; 64] = BASE64_STANDARD
         .decode(&body.proof.signature)
-        .map_err(|_| "failed to deserialize base64 signature")?;
-    let signature = Signature::from_bytes(&sign_b).map_err(|_| "invalid signature")?;
+        .map_err(|e| AppError::BadRequest(e.into()))?
+        .try_into()
+        .map_err(|_| AppError::BadRequest(anyhow!("expected 64 bit long signature")))?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    pubkey
+        .verify(&full_msg_hash, &signature)
+        .map_err(|e| AppError::BadRequest(e.into()))?;
 
-    let check = pubkey.verify(&full_msg_hash, &signature).is_ok();
-    if !check {
-        return Err("proof verification failed".to_string());
-    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let claims = Claims {
+        exp: now + state.ttl,
+        address: addr.to_base64_std(),
+    };
 
-    let key: Hmac<Sha256> =
-        Hmac::new_from_slice(&config.secret.as_bytes()).map_err(|_| "failed to create hmac key")?;
-    let mut claims = BTreeMap::new();
-    claims.insert("address", addr.to_base64_std());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards 🤷")
-        .as_secs();
-    claims.insert("exp", format!("{}", now + config.ttl));
+    use jsonwebtoken::{encode, EncodingKey, Header};
 
-    let token = claims
-        .sign_with_key(&key)
-        .map_err(|_| "failed to sign token")?;
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.secret.as_bytes()),
+    )?;
 
-    Ok(Json(CheckProofResponse { token }))
+    Ok(Json(CheckTonProof { token }))
 }
 
-struct Token(String);
+struct AppState {
+    secret: String,
+    ttl: u64,
+    domain: String,
+    ton_mainnet_contract_factory: TonContractFactory,
+    ton_testnet_contract_factory: TonContractFactory,
+}
 
-use rocket::http::Status;
-use rocket::request::{self, FromRequest, Outcome, Request};
+enum AppError {
+    BadRequest(anyhow::Error),
+    ServerError(anyhow::Error),
+}
 
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for Token {
-    type Error = String;
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, error_message) = match self {
+            Self::BadRequest(e) => (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)),
+            Self::ServerError(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Something went wrong: {}", e),
+            ),
+        };
 
-    async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
-        let token = req.headers().get_one("token");
-        match token {
-            Some(token) => {
-                // skip "Bearer "
-                Outcome::Success(Token(token[7..].to_string()))
-            }
-            None => Outcome::Failure((Status::Unauthorized, "missing jwt".to_string())),
-        }
+        let body = Json(json!({
+            "error": error_message
+        }));
+
+        (status, body).into_response()
     }
+}
+
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self::ServerError(err.into())
+    }
+}
+
+/// ```
+/// {
+///   "address": "0:f63660ff947e5fe6ed4a8f729f1b24ef859497d0483aaa9d9ae48414297c4e1b", // user's address
+///   "network": "-239", // "-239" for mainnet and "-1" for testnet
+///   "proof": {
+///     "timestamp": 1668094767, // unix epoch seconds
+///     "domain": {
+///       "lengthBytes": 21,
+///       "value": "ton-connect.github.io"
+///     },
+///     "signature": "28tWSg8RDB3P/iIYupySINq1o3F5xLodndzNFHOtdi16Z+MuII8LAPnHLT3E6WTB27//qY4psU5Rf5/aJaIIAA==",
+///     "payload": "E5B4ARS6CdOI2b5e1jz0jnS-x-a3DgfNXprrg_3pec0=" // payload from the step 1.
+///   }
+/// }
+/// ```
+#[derive(Deserialize)]
+struct CheckProofPayload {
+    address: String,
+    network: TonNetwork,
+    proof: TonProof,
+}
+
+#[derive(Deserialize)]
+enum TonNetwork {
+    #[serde(rename = "-239")]
+    Mainnet,
+    #[serde(rename = "-3")]
+    Testnet,
+}
+
+#[derive(Deserialize)]
+struct TonProof {
+    domain: TonDomain,
+    payload: String,
+    signature: String,
+    state_init: String,
+    timestamp: u64,
+}
+
+#[derive(Deserialize)]
+struct TonDomain {
+    #[serde(rename = "lengthBytes")]
+    length_bytes: u64,
+    value: String,
 }
 
 #[derive(Serialize)]
-#[serde(crate = "rocket::serde")]
-struct GetAccountInfoResponse {
+struct Claims {
+    exp: u64,
     address: String,
 }
 
-#[get("/getAccountInfo")]
-fn get_account_info(
-    config: &State<Config>,
-    token: Token,
-) -> Result<Json<GetAccountInfoResponse>, String> {
-    let key: Hmac<Sha256> =
-        Hmac::new_from_slice(&config.secret.as_bytes()).map_err(|_| "failed to create hmac key")?;
-    let claims: BTreeMap<String, String> = token
-        .0
-        .verify_with_key(&key)
-        .map_err(|_| "jwt verification failed")?;
-
-    let timestamp = claims
-        .get("exp")
-        .and_then(|exp| exp.parse::<u64>().ok())
-        .ok_or("failed to parse exp".to_string())?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards 🤷")
-        .as_secs();
-    if now >= timestamp {
-        return Err("token expired".to_string());
-    }
-
-    let address = claims.get("address").ok_or("failed to parse address")?;
-
-    Ok(Json(GetAccountInfoResponse {
-        address: address.clone(),
-    }))
+#[derive(Serialize)]
+struct CheckTonProof {
+    token: String,
 }
 
-use rocket::fairing::{Fairing, Info, Kind};
-use rocket::http::Header;
-use rocket::Response;
-
-pub struct CORS;
-
-#[rocket::async_trait]
-impl Fairing for CORS {
-    fn info(&self) -> Info {
-        Info {
-            name: "Add CORS headers to responses",
-            kind: Kind::Response,
-        }
-    }
-
-    async fn on_response<'r>(&self, _request: &'r Request<'_>, response: &mut Response<'r>) {
-        response.set_header(Header::new("Access-Control-Allow-Origin", "*"));
-        response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
-    }
-}
-
-#[launch]
-fn rocket() -> _ {
-    rocket::build()
-        .attach(CORS)
-        .mount("/ton-proof", routes![generate_payload, check_proof])
-        .mount("/dapp", routes![get_account_info])
-        .attach(AdHoc::config::<Config>())
+#[derive(Serialize)]
+struct GenerateTonProofPayload {
+    payload: String,
 }
