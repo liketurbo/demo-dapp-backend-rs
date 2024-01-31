@@ -1,78 +1,118 @@
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use anyhow::anyhow;
 use axum::{
-    extract::State,
-    http::StatusCode,
+    extract::{FromRequestParts, State},
+    http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Json, RequestPartsExt, Router,
+};
+use axum_extra::{
+    headers::{authorization::Bearer, Authorization},
+    TypedHeader,
 };
 use base64::prelude::*;
+use dotenv_codegen::dotenv;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use once_cell::sync::Lazy;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tonlib::{
     address::TonAddress,
     client::TonClient,
     contract::{TonContractFactory, TonContractInterface},
 };
 
+static JWT_KEYS: Lazy<JwtKeys> = Lazy::new(|| {
+    let secret = dotenv!("SECRET");
+    JwtKeys::new(secret.as_bytes())
+});
+
+struct JwtKeys {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+}
+
+impl JwtKeys {
+    pub fn new(secret: &[u8]) -> Self {
+        Self {
+            encoding: EncodingKey::from_secret(secret),
+            decoding: DecodingKey::from_secret(secret),
+        }
+    }
+}
+
+static TTL: Lazy<u64> = Lazy::new(|| {
+    let ttl = dotenv!("TTL");
+    u64::from_str_radix(ttl, 10).expect("invalid TTL number")
+});
+
+static SHARED_SECRET: Lazy<&[u8]> = Lazy::new(|| {
+    let secret = dotenv!("SECRET");
+    secret.as_bytes()
+});
+
+static DOMAIN: Lazy<&str> = Lazy::new(|| dotenv!("DOMAIN"));
+
 #[tokio::main]
 async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let contract_factory = {
+        const MAINNET_NETWORK: &'static str = "-239";
+        const TESTNET_NETWORK: &'static str = "-3";
 
-    const MAINNET_NETWORK: &'static str = "-239";
-    const TESTNET_NETWORK: &'static str = "-3";
+        TonClient::set_log_verbosity_level(0);
+        let ton_client_mainnet = TonClient::builder()
+            .with_pool_size(5)
+            .with_config(MAINNET_NETWORK)
+            .build()
+            .await
+            .unwrap();
+        let ton_client_testnet = TonClient::builder()
+            .with_pool_size(5)
+            .with_config(TESTNET_NETWORK)
+            .build()
+            .await
+            .unwrap();
+        let ton_mainnet_contract_factory = TonContractFactory::builder(&ton_client_mainnet)
+            .build()
+            .await
+            .unwrap();
+        let ton_testnet_contract_factory = TonContractFactory::builder(&ton_client_testnet)
+            .build()
+            .await
+            .unwrap();
 
-    TonClient::set_log_verbosity_level(0);
-    let ton_client_mainnet = TonClient::builder()
-        .with_pool_size(5)
-        .with_config(MAINNET_NETWORK)
-        .build()
-        .await
-        .unwrap();
-    let ton_client_testnet = TonClient::builder()
-        .with_pool_size(5)
-        .with_config(TESTNET_NETWORK)
-        .build()
-        .await
-        .unwrap();
-    let ton_mainnet_contract_factory = TonContractFactory::builder(&ton_client_mainnet)
-        .build()
-        .await
-        .unwrap();
-    let ton_testnet_contract_factory = TonContractFactory::builder(&ton_client_testnet)
-        .build()
-        .await
-        .unwrap();
-
-    let shared_state = Arc::new(AppState {
-        secret,
-        ttl: 3600, // 1 hour
-        domain: "example.com".to_string(),
-        ton_mainnet_contract_factory,
-        ton_testnet_contract_factory,
-    });
+        Arc::new(ContractFactory {
+            mainnet: ton_mainnet_contract_factory,
+            testnet: ton_testnet_contract_factory,
+        })
+    };
 
     // build our application with a route
     let app = Router::new()
         .route("/generatePayload", post(generate_ton_proof_payload))
         .route("/checkProof", post(check_ton_proof))
-        .with_state(shared_state);
+        .route("/getAccountInfo", get(get_account_info))
+        .with_state(contract_factory);
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+struct ContractFactory {
+    mainnet: TonContractFactory,
+    testnet: TonContractFactory,
 }
 
 /// Generate ton_proof payload
@@ -83,22 +123,20 @@ async fn main() {
 /// 0                                       32
 /// |             payload_hex               |
 /// ```
-async fn generate_ton_proof_payload(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<GenerateTonProofPayload>, AppError> {
+async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, AppError> {
     let mut payload: [u8; 48] = [0; 48];
     let mut rng = rand::thread_rng();
     rng.fill(&mut payload[0..8]);
 
     if let Ok(n) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        let expire = n.as_secs() + state.ttl;
+        let expire = n.as_secs() + TTL.clone();
         let expire_be = expire.to_be_bytes();
         payload[8..16].copy_from_slice(&expire_be);
     } else {
         return Err(anyhow!("time went backwards 🤷").into());
     }
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(state.secret.as_bytes())?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&SHARED_SECRET)?;
     mac.update(&payload[0..16]);
     let signature = mac.finalize().into_bytes();
     payload[16..48].copy_from_slice(&signature);
@@ -110,7 +148,7 @@ async fn generate_ton_proof_payload(
 
 /// Check ton_proof
 async fn check_ton_proof(
-    State(state): State<Arc<AppState>>,
+    State(contract_factory): State<Arc<ContractFactory>>,
     Json(body): Json<CheckProofPayload>,
 ) -> Result<Json<CheckTonProof>, AppError> {
     let data = hex::decode(body.proof.payload.clone())?;
@@ -122,7 +160,7 @@ async fn check_ton_proof(
         )));
     }
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(state.secret.as_bytes())?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&SHARED_SECRET)?;
     mac.update(&data[..16]);
     let signature_bytes: [u8; 32] = mac.finalize().into_bytes().into();
     let signature_valid = data
@@ -147,15 +185,15 @@ async fn check_ton_proof(
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     // check ton_proof expiration
-    if now > body.proof.timestamp + state.ttl {
+    if now > body.proof.timestamp + TTL.clone() {
         return Err(AppError::BadRequest(anyhow!("ton_proof has been expired")));
     }
 
-    if body.proof.domain.value != state.domain {
+    if body.proof.domain.value != *DOMAIN {
         return Err(AppError::BadRequest(anyhow!(
             "wrong domain, got {}, expected {}",
             body.proof.domain.value,
-            state.domain
+            *DOMAIN
         )));
     }
 
@@ -195,8 +233,8 @@ async fn check_ton_proof(
     let full_msg_hash = hasher.finalize();
 
     let contract_factory = match body.network {
-        TonNetwork::Mainnet => &state.ton_mainnet_contract_factory,
-        TonNetwork::Testnet => &state.ton_testnet_contract_factory,
+        TonNetwork::Mainnet => &contract_factory.mainnet,
+        TonNetwork::Testnet => &contract_factory.testnet,
     };
 
     let wallet_contract = contract_factory.get_contract(&addr);
@@ -221,32 +259,25 @@ async fn check_ton_proof(
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let claims = Claims {
-        exp: now + state.ttl,
+        exp: now + TTL.clone(),
         address: addr.to_base64_std(),
     };
 
-    use jsonwebtoken::{encode, EncodingKey, Header};
-
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.secret.as_bytes()),
-    )?;
+    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)?;
 
     Ok(Json(CheckTonProof { token }))
 }
 
-struct AppState {
-    secret: String,
-    ttl: u64,
-    domain: String,
-    ton_mainnet_contract_factory: TonContractFactory,
-    ton_testnet_contract_factory: TonContractFactory,
+async fn get_account_info(claims: Claims) -> Result<Json<WalletAddress>, AppError> {
+    Ok(Json(WalletAddress {
+        address: claims.address,
+    }))
 }
 
 enum AppError {
     BadRequest(anyhow::Error),
     ServerError(anyhow::Error),
+    Unauthorized(anyhow::Error),
 }
 
 impl IntoResponse for AppError {
@@ -256,6 +287,10 @@ impl IntoResponse for AppError {
             Self::ServerError(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Something went wrong: {}", e),
+            ),
+            Self::Unauthorized(e) => (
+                StatusCode::UNAUTHORIZED,
+                format!("Authorization error: {}", e),
             ),
         };
 
@@ -322,7 +357,7 @@ struct TonDomain {
     value: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Claims {
     exp: u64,
     address: String,
@@ -336,4 +371,39 @@ struct CheckTonProof {
 #[derive(Serialize)]
 struct GenerateTonProofPayload {
     payload: String,
+}
+
+#[derive(Serialize)]
+struct WalletAddress {
+    address: String,
+}
+
+#[async_trait::async_trait]
+impl<S> FromRequestParts<S> for Claims
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Extract the token from the authorization header
+        let TypedHeader(Authorization(bearer)) = parts
+            .extract::<TypedHeader<Authorization<Bearer>>>()
+            .await
+            .map_err(|e| AppError::Unauthorized(e.into()))?;
+
+        // Decode the user data
+        let token_data =
+            decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
+                .map_err(|e| AppError::Unauthorized(e.into()))?;
+
+        let timestamp = token_data.claims.exp;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        if now >= timestamp {
+            return Err(AppError::Unauthorized(anyhow!("token expired")));
+        }
+
+        Ok(token_data.claims)
+    }
 }
