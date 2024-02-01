@@ -15,25 +15,28 @@ use dotenv_codegen::dotenv;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    fmt::Debug,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::time::timeout;
 use tonlib::{
     address::TonAddress,
     client::TonClient,
+    config::{MAINNET_CONFIG, TESTNET_CONFIG},
     contract::{TonContractFactory, TonContractInterface},
 };
 
-static JWT_KEYS: Lazy<JwtKeys> = Lazy::new(|| {
-    let secret = dotenv!("SECRET");
-    JwtKeys::new(secret.as_bytes())
-});
+static JWT_KEYS: OnceCell<JwtKeys> = OnceCell::new();
+static TTL: OnceCell<u64> = OnceCell::new();
+static SHARED_SECRET: OnceCell<&[u8]> = OnceCell::new();
+static DOMAIN: OnceCell<&str> = OnceCell::new();
 
 struct JwtKeys {
     encoding: EncodingKey,
@@ -49,37 +52,65 @@ impl JwtKeys {
     }
 }
 
-static TTL: Lazy<u64> = Lazy::new(|| {
-    let ttl = dotenv!("TTL");
-    u64::from_str_radix(ttl, 10).expect("invalid TTL number")
-});
-
-static SHARED_SECRET: Lazy<&[u8]> = Lazy::new(|| {
-    let secret = dotenv!("SECRET");
-    secret.as_bytes()
-});
-
-static DOMAIN: Lazy<&str> = Lazy::new(|| dotenv!("DOMAIN"));
+// Need for .unwrap() to work
+impl Debug for JwtKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtKeys")
+            .field("encoding", &"xxxxx".to_string())
+            .field("decoding", &"xxxxx".to_string())
+            .finish()
+    }
+}
 
 #[tokio::main]
 async fn main() {
+    JWT_KEYS
+        .set({
+            let secret = dotenv!("SECRET");
+            if secret.is_empty() {
+                panic!("empty secret")
+            }
+            JwtKeys::new(secret.as_bytes())
+        })
+        .unwrap();
+    TTL.set({
+        let ttl = dotenv!("TTL");
+        u64::from_str_radix(ttl, 10).expect("invalid TTL number")
+    })
+    .unwrap();
+    SHARED_SECRET
+        .set({
+            let secret = dotenv!("SECRET");
+            if secret.is_empty() {
+                panic!("empty secret")
+            }
+            secret.as_bytes()
+        })
+        .unwrap();
+    DOMAIN
+        .set({
+            let domain = dotenv!("DOMAIN");
+            if domain.is_empty() {
+                panic!("empty domain");
+            }
+            domain
+        })
+        .unwrap();
+
     // initialize tracing
     tracing_subscriber::fmt::init();
 
     let contract_factory = {
-        const MAINNET_NETWORK: &'static str = "-239";
-        const TESTNET_NETWORK: &'static str = "-3";
-
         TonClient::set_log_verbosity_level(0);
         let ton_client_mainnet = TonClient::builder()
             .with_pool_size(5)
-            .with_config(MAINNET_NETWORK)
+            .with_config(MAINNET_CONFIG)
             .build()
             .await
             .unwrap();
         let ton_client_testnet = TonClient::builder()
             .with_pool_size(5)
-            .with_config(TESTNET_NETWORK)
+            .with_config(TESTNET_CONFIG)
             .build()
             .await
             .unwrap();
@@ -129,14 +160,14 @@ async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, A
     rng.fill(&mut payload[0..8]);
 
     if let Ok(n) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        let expire = n.as_secs() + TTL.clone();
+        let expire = n.as_secs() + TTL.get().unwrap();
         let expire_be = expire.to_be_bytes();
         payload[8..16].copy_from_slice(&expire_be);
     } else {
         return Err(anyhow!("time went backwards 🤷").into());
     }
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(&SHARED_SECRET)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET.get().unwrap())?;
     mac.update(&payload[0..16]);
     let signature = mac.finalize().into_bytes();
     payload[16..48].copy_from_slice(&signature);
@@ -160,7 +191,7 @@ async fn check_ton_proof(
         )));
     }
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(&SHARED_SECRET)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET.get().unwrap())?;
     mac.update(&data[..16]);
     let signature_bytes: [u8; 32] = mac.finalize().into_bytes().into();
     let signature_valid = data
@@ -185,15 +216,15 @@ async fn check_ton_proof(
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     // check ton_proof expiration
-    if now > body.proof.timestamp + TTL.clone() {
+    if now > body.proof.timestamp + TTL.get().unwrap() {
         return Err(AppError::BadRequest(anyhow!("ton_proof has been expired")));
     }
 
-    if body.proof.domain.value != *DOMAIN {
+    if body.proof.domain.value != *DOMAIN.get().unwrap() {
         return Err(AppError::BadRequest(anyhow!(
             "wrong domain, got {}, expected {}",
             body.proof.domain.value,
-            *DOMAIN
+            *DOMAIN.get().unwrap()
         )));
     }
 
@@ -238,9 +269,13 @@ async fn check_ton_proof(
     };
 
     let wallet_contract = contract_factory.get_contract(&addr);
-    let res = wallet_contract
-        .run_get_method("get_public_key", &vec![])
-        .await?;
+    let res = timeout(
+        Duration::from_secs(10),
+        wallet_contract.run_get_method("get_public_key", &vec![]),
+    ).await.map_err(|_| { 
+        anyhow!("liteserver timeout")
+    })??;
+
     let pubkey_n = res.stack.get_biguint(0)?;
     let pubkey_bytes: [u8; 32] = pubkey_n
         .to_bytes_be()
@@ -259,11 +294,15 @@ async fn check_ton_proof(
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let claims = Claims {
-        exp: now + TTL.clone(),
+        exp: now + TTL.get().unwrap(),
         address: addr.to_base64_std(),
     };
 
-    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)?;
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &JWT_KEYS.get().unwrap().encoding,
+    )?;
 
     Ok(Json(CheckTonProof { token }))
 }
@@ -393,9 +432,12 @@ where
             .map_err(|e| AppError::Unauthorized(e.into()))?;
 
         // Decode the user data
-        let token_data =
-            decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
-                .map_err(|e| AppError::Unauthorized(e.into()))?;
+        let token_data = decode::<Claims>(
+            bearer.token(),
+            &JWT_KEYS.get().unwrap().decoding,
+            &Validation::default(),
+        )
+        .map_err(|e| AppError::Unauthorized(e.into()))?;
 
         let timestamp = token_data.claims.exp;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
