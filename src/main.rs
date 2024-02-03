@@ -1,11 +1,14 @@
-use anyhow::anyhow;
+use crate::{
+    dto::{CheckTonProof, TonNetwork},
+    error::{anyhow, AppError},
+};
 use async_trait::async_trait;
 use axum::{
     extract::{FromRequest, FromRequestParts, Request, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         request::Parts,
-        HeaderValue, Method, StatusCode,
+        HeaderValue, Method,
     },
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,13 +20,13 @@ use axum_extra::{
 };
 use base64::prelude::*;
 use dotenv_codegen::dotenv;
+use dto::{CheckProofPayload, GenerateTonProofPayload, WalletAddress};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use once_cell::sync::OnceCell;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     fmt::Debug,
@@ -38,6 +41,9 @@ use tonlib::{
     contract::{TonContractFactory, TonContractInterface},
 };
 use tower_http::cors::CorsLayer;
+
+mod dto;
+mod error;
 
 static JWT_KEYS: OnceCell<JwtKeys> = OnceCell::new();
 static TTL: OnceCell<u64> = OnceCell::new();
@@ -334,112 +340,9 @@ async fn get_account_info(claims: Claims) -> Result<Json<WalletAddress>, AppErro
     }))
 }
 
-enum AppError {
-    BadRequest(anyhow::Error),
-    ServerError(anyhow::Error),
-    Unauthorized(anyhow::Error),
-    UnsupportedMedia(anyhow::Error),
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let (status, error_message) = match self {
-            Self::BadRequest(e) => (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)),
-            Self::ServerError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Something went wrong: {}", e),
-            ),
-            Self::Unauthorized(e) => (
-                StatusCode::UNAUTHORIZED,
-                format!("Authorization error: {}", e),
-            ),
-            Self::UnsupportedMedia(e) => (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                format!("Unsupported media: {}", e),
-            ),
-        };
-
-        let body = Json(json!({
-            "error": error_message
-        }));
-
-        (status, body).into_response()
-    }
-}
-
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        Self::ServerError(err.into())
-    }
-}
-
-/// ```
-/// {
-///   "address": "0:f63660ff947e5fe6ed4a8f729f1b24ef859497d0483aaa9d9ae48414297c4e1b", // user's address
-///   "network": "-239", // "-239" for mainnet and "-1" for testnet
-///   "proof": {
-///     "timestamp": 1668094767, // unix epoch seconds
-///     "domain": {
-///       "lengthBytes": 21,
-///       "value": "ton-connect.github.io"
-///     },
-///     "signature": "28tWSg8RDB3P/iIYupySINq1o3F5xLodndzNFHOtdi16Z+MuII8LAPnHLT3E6WTB27//qY4psU5Rf5/aJaIIAA==",
-///     "payload": "E5B4ARS6CdOI2b5e1jz0jnS-x-a3DgfNXprrg_3pec0=" // payload from the step 1.
-///   }
-/// }
-/// ```
-#[derive(Deserialize)]
-struct CheckProofPayload {
-    address: String,
-    network: TonNetwork,
-    proof: TonProof,
-}
-
-#[derive(Deserialize)]
-enum TonNetwork {
-    #[serde(rename = "-239")]
-    Mainnet,
-    #[serde(rename = "-3")]
-    Testnet,
-}
-
-#[derive(Deserialize)]
-struct TonProof {
-    domain: TonDomain,
-    payload: String,
-    signature: String,
-    state_init: String,
-    timestamp: u64,
-}
-
-#[derive(Deserialize)]
-struct TonDomain {
-    #[serde(rename = "lengthBytes")]
-    length_bytes: u64,
-    value: String,
-}
-
 #[derive(Serialize, Deserialize)]
 struct Claims {
     exp: u64,
-    address: String,
-}
-
-#[derive(Serialize)]
-struct CheckTonProof {
-    token: String,
-}
-
-#[derive(Serialize)]
-struct GenerateTonProofPayload {
-    payload: String,
-}
-
-#[derive(Serialize)]
-struct WalletAddress {
     address: String,
 }
 
@@ -476,6 +379,7 @@ where
     }
 }
 
+// to make accept json with content-type: text/plain
 struct JsonOrPlain<T>(T);
 
 #[async_trait]
