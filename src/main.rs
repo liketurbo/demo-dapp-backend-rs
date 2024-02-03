@@ -1,10 +1,15 @@
 use anyhow::anyhow;
+use async_trait::async_trait;
 use axum::{
-    extract::{FromRequestParts, State},
-    http::{request::Parts, StatusCode},
+    extract::{FromRequest, FromRequestParts, Request, State},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        request::Parts,
+        HeaderValue, Method, StatusCode,
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, RequestPartsExt, Router,
+    Json, RequestExt, RequestPartsExt, Router,
 };
 use axum_extra::{
     headers::{authorization::Bearer, Authorization},
@@ -32,6 +37,7 @@ use tonlib::{
     config::{MAINNET_CONFIG, TESTNET_CONFIG},
     contract::{TonContractFactory, TonContractInterface},
 };
+use tower_http::cors::CorsLayer;
 
 static JWT_KEYS: OnceCell<JwtKeys> = OnceCell::new();
 static TTL: OnceCell<u64> = OnceCell::new();
@@ -131,9 +137,24 @@ async fn main() {
 
     // build our application with a route
     let app = Router::new()
-        .route("/generatePayload", post(generate_ton_proof_payload))
-        .route("/checkProof", post(check_ton_proof))
-        .route("/getAccountInfo", get(get_account_info))
+        .route(
+            "/ton-proof/generatePayload",
+            post(generate_ton_proof_payload),
+        )
+        .route("/ton-proof/checkProof", post(check_ton_proof))
+        .route("/dapp/getAccountInfo", get(get_account_info))
+        .layer(
+            // see https://docs.rs/tower-http/latest/tower_http/cors/index.html
+            // for more details
+            //
+            // pay attention that for some request types like posting content-type: application/json
+            // it is required to add ".allow_headers([http::header::CONTENT_TYPE])"
+            // or see this issue https://github.com/tokio-rs/axum/issues/849
+            CorsLayer::new()
+                .allow_origin("http://localhost:3001".parse::<HeaderValue>().unwrap())
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+                .allow_methods([Method::GET, Method::POST]),
+        )
         .with_state(contract_factory);
 
     // run our app with hyper, listening globally on port 3000
@@ -180,7 +201,7 @@ async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, A
 /// Check ton_proof
 async fn check_ton_proof(
     State(contract_factory): State<Arc<ContractFactory>>,
-    Json(body): Json<CheckProofPayload>,
+    JsonOrPlain(body): JsonOrPlain<CheckProofPayload>,
 ) -> Result<Json<CheckTonProof>, AppError> {
     let data = hex::decode(body.proof.payload.clone())?;
 
@@ -200,7 +221,7 @@ async fn check_ton_proof(
         .zip(signature_bytes.iter().take(16))
         .all(|(a, b)| a == b);
 
-    if signature_valid {
+    if !signature_valid {
         return Err(AppError::BadRequest(anyhow!("invalid payload signature")));
     }
 
@@ -272,9 +293,9 @@ async fn check_ton_proof(
     let res = timeout(
         Duration::from_secs(10),
         wallet_contract.run_get_method("get_public_key", &vec![]),
-    ).await.map_err(|_| { 
-        anyhow!("liteserver timeout")
-    })??;
+    )
+    .await
+    .map_err(|_| anyhow!("liteserver timeout"))??;
 
     let pubkey_n = res.stack.get_biguint(0)?;
     let pubkey_bytes: [u8; 32] = pubkey_n
@@ -317,6 +338,7 @@ enum AppError {
     BadRequest(anyhow::Error),
     ServerError(anyhow::Error),
     Unauthorized(anyhow::Error),
+    UnsupportedMedia(anyhow::Error),
 }
 
 impl IntoResponse for AppError {
@@ -330,6 +352,10 @@ impl IntoResponse for AppError {
             Self::Unauthorized(e) => (
                 StatusCode::UNAUTHORIZED,
                 format!("Authorization error: {}", e),
+            ),
+            Self::UnsupportedMedia(e) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("Unsupported media: {}", e),
             ),
         };
 
@@ -417,7 +443,7 @@ struct WalletAddress {
     address: String,
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl<S> FromRequestParts<S> for Claims
 where
     S: Send + Sync,
@@ -447,5 +473,47 @@ where
         }
 
         Ok(token_data.claims)
+    }
+}
+
+struct JsonOrPlain<T>(T);
+
+#[async_trait]
+impl<S, T> FromRequest<S> for JsonOrPlain<T>
+where
+    S: Send + Sync,
+    Json<T>: FromRequest<()>,
+    T: 'static,
+{
+    type Rejection = Response;
+
+    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let content_type_header = req.headers().get(CONTENT_TYPE);
+        let content_type = content_type_header.and_then(|value| value.to_str().ok());
+
+        if let Some(content_type) = content_type {
+            if content_type.starts_with("application/json")
+                || content_type.starts_with("text/plain")
+            {
+                if content_type.starts_with("text/plain") {
+                    let content_type = req
+                        .headers_mut()
+                        .get_mut(CONTENT_TYPE)
+                        .expect("checked above");
+                    *content_type = HeaderValue::from_static("application/json");
+                }
+
+                let Json(payload) = req
+                    .extract::<Json<T>, _>()
+                    .await
+                    .map_err(|err| err.into_response())?;
+                return Ok(Self(payload));
+            }
+        }
+
+        Err(
+            AppError::UnsupportedMedia(anyhow!("expected application/json content type"))
+                .into_response(),
+        )
     }
 }
