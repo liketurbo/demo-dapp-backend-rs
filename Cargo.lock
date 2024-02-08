@@ -2009,8 +2009,7 @@ dependencies = [
 [[package]]
 name = "tonlib"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4124809e519561cc844d817e52434b7bb32ef427c927003f07f872e4c73f1f5"
+source = "git+https://github.com/liketurbo/tonlib-rs.git?branch=extend-wallets#a1be64e4361d68d42332334892496a7287aeb9ef"
 dependencies = [
  "async-trait",
  "base64 0.13.1",

@@ -24,21 +24,23 @@ use dto::{CheckProofPayload, GenerateTonProofPayload, WalletAddress};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fmt::Debug,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::timeout;
 use tonlib::{
-    address::TonAddress,
+    cell::BagOfCells,
     client::TonClient,
     config::{MAINNET_CONFIG, TESTNET_CONFIG},
     contract::{TonContractFactory, TonContractInterface},
+    wallet::{DataHighloadV2R2, DataV1R1, DataV3R1, DataV4R1, WalletVersion},
 };
 use tower_http::cors::CorsLayer;
 
@@ -49,6 +51,37 @@ static JWT_KEYS: OnceCell<JwtKeys> = OnceCell::new();
 static TTL: OnceCell<u64> = OnceCell::new();
 static SHARED_SECRET: OnceCell<&[u8]> = OnceCell::new();
 static DOMAIN: OnceCell<&str> = OnceCell::new();
+static KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
+    let mut known_hashes = HashMap::new();
+    let all_versions = [
+        WalletVersion::V1R1,
+        WalletVersion::V1R2,
+        WalletVersion::V1R3,
+        WalletVersion::V2R1,
+        WalletVersion::V2R2,
+        WalletVersion::V3R1,
+        WalletVersion::V3R2,
+        WalletVersion::V4R1,
+        WalletVersion::V4R2,
+        WalletVersion::HighloadV1R1,
+        WalletVersion::HighloadV1R2,
+        WalletVersion::HighloadV2,
+        WalletVersion::HighloadV2R1,
+        WalletVersion::HighloadV2R2,
+    ];
+    all_versions.into_iter().for_each(|v| {
+        let hash: [u8; 32] = v
+            .code()
+            .single_root()
+            .unwrap()
+            .cell_hash()
+            .unwrap()
+            .try_into()
+            .expect("all hashes [u8; 32], right?");
+        known_hashes.insert(hash, v);
+    });
+    known_hashes
+});
 
 struct JwtKeys {
     encoding: EncodingKey,
@@ -115,29 +148,27 @@ async fn main() {
     let contract_factory = {
         TonClient::set_log_verbosity_level(0);
         let ton_client_mainnet = TonClient::builder()
-            .with_pool_size(5)
             .with_config(MAINNET_CONFIG)
+            .with_pool_size(10)
             .build()
             .await
             .unwrap();
         let ton_client_testnet = TonClient::builder()
-            .with_pool_size(5)
             .with_config(TESTNET_CONFIG)
-            .build()
-            .await
-            .unwrap();
-        let ton_mainnet_contract_factory = TonContractFactory::builder(&ton_client_mainnet)
-            .build()
-            .await
-            .unwrap();
-        let ton_testnet_contract_factory = TonContractFactory::builder(&ton_client_testnet)
+            .with_pool_size(10)
             .build()
             .await
             .unwrap();
 
         Arc::new(ContractFactory {
-            mainnet: ton_mainnet_contract_factory,
-            testnet: ton_testnet_contract_factory,
+            mainnet: TonContractFactory::builder(&ton_client_mainnet)
+                .build()
+                .await
+                .unwrap(),
+            testnet: TonContractFactory::builder(&ton_client_testnet)
+                .build()
+                .await
+                .unwrap(),
         })
     };
 
@@ -264,13 +295,10 @@ async fn check_ton_proof(
 
     const TON_PROOF_PREFIX: &'static str = "ton-proof-item-v2/";
 
-    let addr =
-        TonAddress::from_hex_str(&body.address).map_err(|e| AppError::BadRequest(e.into()))?;
-
     let mut msg: Vec<u8> = Vec::new();
     msg.extend_from_slice(TON_PROOF_PREFIX.as_bytes());
-    msg.extend_from_slice(&addr.workchain.to_be_bytes());
-    msg.extend_from_slice(&addr.hash_part); // should it be big endian?
+    msg.extend_from_slice(&body.address.workchain.to_be_bytes());
+    msg.extend_from_slice(&body.address.hash_part); // should it be big endian?
     msg.extend_from_slice(&(body.proof.domain.length_bytes as u32).to_le_bytes());
     msg.extend_from_slice(body.proof.domain.value.as_bytes());
     msg.extend_from_slice(&body.proof.timestamp.to_le_bytes());
@@ -295,19 +323,88 @@ async fn check_ton_proof(
         TonNetwork::Testnet => &contract_factory.testnet,
     };
 
-    let wallet_contract = contract_factory.get_contract(&addr);
-    let res = timeout(
+    let wallet_contract = contract_factory.get_contract(&body.address);
+
+    let pubkey_bytes = match timeout(
         Duration::from_secs(10),
         wallet_contract.run_get_method("get_public_key", &vec![]),
     )
     .await
-    .map_err(|_| anyhow!("liteserver timeout"))??;
+    {
+        Ok(Ok(r)) => {
+            let pubkey_n = r.stack.get_biguint(0)?;
+            let pubkey_b: [u8; 32] = pubkey_n.to_bytes_be().try_into().map_err(|_| {
+                anyhow!("failed to extract 32 bits long public from the wallet contract")
+            })?;
+            pubkey_b
+        }
+        Err(_) | Ok(Err(_)) => {
+            let bytes = BASE64_STANDARD
+                .decode(&body.proof.state_init)
+                .map_err(|e| AppError::BadRequest(e.into()))?;
+            let boc = BagOfCells::parse(&bytes).map_err(|e| AppError::BadRequest(e.into()))?;
+            let hash: [u8; 32] = boc
+                .single_root()
+                .map_err(|e| AppError::BadRequest(e.into()))?
+                .cell_hash()
+                .map_err(|e| AppError::BadRequest(e.into()))?
+                .try_into()
+                .map_err(|_| AppError::BadRequest(anyhow!("invalid state_init length")))?;
 
-    let pubkey_n = res.stack.get_biguint(0)?;
-    let pubkey_bytes: [u8; 32] = pubkey_n
-        .to_bytes_be()
-        .try_into()
-        .map_err(|_| anyhow!("failed to extract 32 bits long public from the wallet contract"))?;
+            if hash != body.address.hash_part {
+                return Err(AppError::BadRequest(anyhow!("wrong address in state_init")));
+            }
+
+            let root = boc.single_root().expect("checked above");
+            let code = root
+                .reference(0)
+                .map_err(|e| AppError::BadRequest(e.into()))?;
+            let data = root
+                .reference(1)
+                .map_err(|e| AppError::BadRequest(e.into()))?;
+
+            let code_hash: [u8; 32] = code
+                .cell_hash()
+                .map_err(|e| AppError::BadRequest(e.into()))?
+                .try_into()
+                .map_err(|_| AppError::BadRequest(anyhow!("invalid code of wallet")))?;
+            let version = KNOWN_HASHES
+                .get(&code_hash)
+                .ok_or(AppError::BadRequest(anyhow!("not known wallet version")))?;
+
+            let pubkey_b = match version {
+                WalletVersion::V1R1
+                | WalletVersion::V1R2
+                | WalletVersion::V1R3
+                | WalletVersion::V2R1
+                | WalletVersion::V2R2 => {
+                    let data = TryInto::<DataV1R1>::try_into(data.as_ref())
+                        .map_err(|e| AppError::BadRequest(e.into()))?;
+                    data.public_key
+                }
+                WalletVersion::V3R1 | WalletVersion::V3R2 => {
+                    let data = TryInto::<DataV3R1>::try_into(data.as_ref())
+                        .map_err(|e| AppError::BadRequest(e.into()))?;
+                    data.public_key
+                }
+                WalletVersion::V4R1 | WalletVersion::V4R2 => {
+                    let data = TryInto::<DataV4R1>::try_into(data.as_ref())
+                        .map_err(|e| AppError::BadRequest(e.into()))?;
+                    data.public_key
+                }
+                WalletVersion::HighloadV2R2 => {
+                    let data = TryInto::<DataHighloadV2R2>::try_into(data.as_ref())
+                        .map_err(|e| AppError::BadRequest(e.into()))?;
+                    data.public_key
+                }
+                _ => {
+                    unimplemented!("no generation for that wallet version")
+                }
+            };
+
+            pubkey_b
+        }
+    };
     let pubkey = VerifyingKey::from_bytes(&pubkey_bytes)?;
     let signature_bytes: [u8; 64] = BASE64_STANDARD
         .decode(&body.proof.signature)
@@ -322,7 +419,7 @@ async fn check_ton_proof(
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let claims = Claims {
         exp: now + TTL.get().unwrap(),
-        address: addr.to_base64_std(),
+        address: body.address.to_base64_std(),
     };
 
     let token = encode(

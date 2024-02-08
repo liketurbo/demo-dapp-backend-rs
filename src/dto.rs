@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tonlib::address::TonAddress;
 
 #[derive(Serialize)]
 pub struct GenerateTonProofPayload {
@@ -22,7 +23,7 @@ pub struct GenerateTonProofPayload {
 /// ```
 #[derive(Deserialize)]
 pub struct CheckProofPayload {
-    pub address: String,
+    pub address: TonAddress,
     pub network: TonNetwork,
     pub proof: TonProof,
 }
