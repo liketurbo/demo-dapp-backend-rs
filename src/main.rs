@@ -235,7 +235,6 @@ async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, A
     Ok(Json(GenerateTonProofPayload { payload: hex }))
 }
 
-/// Check ton_proof
 async fn check_ton_proof(
     State(contract_factory): State<Arc<ContractFactory>>,
     JsonOrPlain(body): JsonOrPlain<CheckProofPayload>,
@@ -476,7 +475,9 @@ where
     }
 }
 
-// to make accept json with content-type: text/plain
+// To work with [ton-connect/demo-dapp-with-backend example](https://github.com/ton-connect/demo-dapp-with-backend),
+// which sends JSON requests with content-type: text/plain.
+// In a real application, you probably won't need this part.
 struct JsonOrPlain<T>(T);
 
 #[async_trait]
