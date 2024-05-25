@@ -158,23 +158,17 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
-
-[[package]]
-name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
 name = "base64-serde"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e964e3e0a930303c7c0bdb28ebf691dd98d9eee4b8b68019d2c995710b58a18"
+checksum = "ba368df5de76a5bea49aaf0cf1b39ccfbbef176924d1ba5db3e4135216cbe3c7"
 dependencies = [
- "base64 0.13.1",
+ "base64",
  "serde",
 ]
 
@@ -425,7 +419,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-extra",
- "base64 0.21.7",
+ "base64",
  "dotenv",
  "dotenv_codegen",
  "ed25519-dalek",
@@ -773,7 +767,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "322106e6bd0cba2d5ead589ddb8150a13d7c4217cf80d7c4f682ca994ccc6aa9"
 dependencies = [
- "base64 0.21.7",
+ "base64",
  "bytes",
  "headers-core",
  "http 1.0.0",
@@ -1030,7 +1024,7 @@ version = "9.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7ea04a7c5c055c175f189b6dc6ba036fd62306b58c66c9f6389036c503a3f4"
 dependencies = [
- "base64 0.21.7",
+ "base64",
  "js-sys",
  "ring",
  "serde",
@@ -1298,9 +1292,9 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7676374caaee8a325c9e7a2ae557f216c5563a171d6997b0ef8a65af35147700"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
 dependencies = [
  "base64ct",
  "rand_core",
@@ -1309,9 +1303,9 @@ dependencies = [
 
 [[package]]
 name = "pbkdf2"
-version = "0.11.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a0692ec44e4cf1ef28ca317f14f8f07da2d95ec3fa01f86e4467b725e60917"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest",
  "hmac",
@@ -1489,7 +1483,7 @@ version = "0.11.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b1ae8d9ac08420c66222fb9096fc5de435c3c48542bc5336c51892cffafb41"
 dependencies = [
- "base64 0.21.7",
+ "base64",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -2008,11 +2002,12 @@ dependencies = [
 
 [[package]]
 name = "tonlib"
-version = "0.12.1"
-source = "git+https://github.com/liketurbo/tonlib-rs.git?branch=extend-wallets#a1be64e4361d68d42332334892496a7287aeb9ef"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b9cf024c1dc49249da3f85b8b0e6bb60707be0bb87b7265bbf718c5ff9888b2"
 dependencies = [
  "async-trait",
- "base64 0.13.1",
+ "base64",
  "base64-serde",
  "bitstream-io",
  "crc",
@@ -2042,12 +2037,11 @@ dependencies = [
 
 [[package]]
 name = "tonlib-sys"
-version = "2023.6.4"
+version = "2024.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d92126581b2ccb79c220ec653f9025aea74671e884968b88752ce230ab6e5d8"
+checksum = "14b9e39800de7d31dc164a774426fc24c7e1d441c8a6a0af7f54cb600ada39c2"
 dependencies = [
  "cmake",
- "num_cpus",
 ]
 
 [[package]]

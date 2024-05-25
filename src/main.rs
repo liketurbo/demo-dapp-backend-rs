@@ -40,7 +40,7 @@ use tonlib::{
     client::TonClient,
     config::{MAINNET_CONFIG, TESTNET_CONFIG},
     contract::{TonContractFactory, TonContractInterface},
-    wallet::{DataHighloadV2R2, DataV1R1, DataV3R1, DataV4R1, WalletVersion},
+    wallet::{WalletDataHighloadV2R2, WalletDataV1V2, WalletDataV3, WalletDataV4, WalletVersion},
 };
 use tower_http::cors::CorsLayer;
 
@@ -72,7 +72,6 @@ static KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
     all_versions.into_iter().for_each(|v| {
         let hash: [u8; 32] = v
             .code()
-            .single_root()
             .unwrap()
             .cell_hash()
             .unwrap()
@@ -109,6 +108,7 @@ impl Debug for JwtKeys {
 
 #[tokio::main]
 async fn main() {
+    // setting variables from .env
     JWT_KEYS
         .set({
             let secret = dotenv!("SECRET");
@@ -360,7 +360,9 @@ async fn check_ton_proof(
                 .map_err(|e| AppError::BadRequest(e.into()))?;
             let data = root
                 .reference(1)
-                .map_err(|e| AppError::BadRequest(e.into()))?;
+                .map_err(|e| AppError::BadRequest(e.into()))?
+                .as_ref()
+                .clone();
 
             let code_hash: [u8; 32] = code
                 .cell_hash()
@@ -377,22 +379,22 @@ async fn check_ton_proof(
                 | WalletVersion::V1R3
                 | WalletVersion::V2R1
                 | WalletVersion::V2R2 => {
-                    let data = TryInto::<DataV1R1>::try_into(data.as_ref())
+                    let data = WalletDataV1V2::try_from(data)
                         .map_err(|e| AppError::BadRequest(e.into()))?;
                     data.public_key
                 }
                 WalletVersion::V3R1 | WalletVersion::V3R2 => {
-                    let data = TryInto::<DataV3R1>::try_into(data.as_ref())
+                    let data = WalletDataV3::try_from(data)
                         .map_err(|e| AppError::BadRequest(e.into()))?;
                     data.public_key
                 }
                 WalletVersion::V4R1 | WalletVersion::V4R2 => {
-                    let data = TryInto::<DataV4R1>::try_into(data.as_ref())
+                    let data = WalletDataV4::try_from(data)
                         .map_err(|e| AppError::BadRequest(e.into()))?;
                     data.public_key
                 }
                 WalletVersion::HighloadV2R2 => {
-                    let data = TryInto::<DataHighloadV2R2>::try_into(data.as_ref())
+                    let data = WalletDataHighloadV2R2::try_from(data)
                         .map_err(|e| AppError::BadRequest(e.into()))?;
                     data.public_key
                 }

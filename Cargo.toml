@@ -16,7 +16,7 @@ hmac = "^0.12"
 sha2 = "^0.10"
 hex = "^0.4"
 anyhow = "^1.0"
-tonlib = { git = "https://github.com/liketurbo/tonlib-rs.git", branch = "extend-wallets" }
+tonlib = "^0.14"
 ed25519-dalek = "^2.1"
 base64 = "^0.21"
 jsonwebtoken = { version = "^9.2", default-features = false }
