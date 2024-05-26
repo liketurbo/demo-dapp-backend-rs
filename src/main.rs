@@ -19,18 +19,16 @@ use axum_extra::{
     TypedHeader,
 };
 use base64::prelude::*;
-use dotenv_codegen::dotenv;
 use dto::{CheckProofPayload, GenerateTonProofPayload, WalletAddress};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fmt::Debug,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -47,11 +45,12 @@ use tower_http::cors::CorsLayer;
 mod dto;
 mod error;
 
-static JWT_KEYS: OnceCell<JwtKeys> = OnceCell::new();
-static TTL: OnceCell<u64> = OnceCell::new();
-static SHARED_SECRET: OnceCell<&[u8]> = OnceCell::new();
-static DOMAIN: OnceCell<&str> = OnceCell::new();
-static KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
+const SHARED_SECRET: &[u8] = "shhhh".as_bytes();
+const DOMAIN: &str = "ton-connect.github.io";
+const TTL: u64 = 3600;
+
+const JWT_KEYS: Lazy<JwtKeys> = Lazy::new(|| JwtKeys::new(SHARED_SECRET));
+const KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
     let mut known_hashes = HashMap::new();
     let all_versions = [
         WalletVersion::V1R1,
@@ -82,69 +81,8 @@ static KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
     known_hashes
 });
 
-struct JwtKeys {
-    encoding: EncodingKey,
-    decoding: DecodingKey,
-}
-
-impl JwtKeys {
-    pub fn new(secret: &[u8]) -> Self {
-        Self {
-            encoding: EncodingKey::from_secret(secret),
-            decoding: DecodingKey::from_secret(secret),
-        }
-    }
-}
-
-// Need for .unwrap() to work
-impl Debug for JwtKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JwtKeys")
-            .field("encoding", &"xxxxx".to_string())
-            .field("decoding", &"xxxxx".to_string())
-            .finish()
-    }
-}
-
 #[tokio::main]
 async fn main() {
-    // setting variables from .env
-    JWT_KEYS
-        .set({
-            let secret = dotenv!("SECRET");
-            if secret.is_empty() {
-                panic!("empty secret")
-            }
-            JwtKeys::new(secret.as_bytes())
-        })
-        .unwrap();
-    TTL.set({
-        let ttl = dotenv!("TTL");
-        u64::from_str_radix(ttl, 10).expect("invalid TTL number")
-    })
-    .unwrap();
-    SHARED_SECRET
-        .set({
-            let secret = dotenv!("SECRET");
-            if secret.is_empty() {
-                panic!("empty secret")
-            }
-            secret.as_bytes()
-        })
-        .unwrap();
-    DOMAIN
-        .set({
-            let domain = dotenv!("DOMAIN");
-            if domain.is_empty() {
-                panic!("empty domain");
-            }
-            domain
-        })
-        .unwrap();
-
-    // initialize tracing
-    tracing_subscriber::fmt::init();
-
     let contract_factory = {
         TonClient::set_log_verbosity_level(0);
         let ton_client_mainnet = TonClient::builder()
@@ -218,14 +156,14 @@ async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, A
     rng.fill(&mut payload[0..8]);
 
     if let Ok(n) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        let expire = n.as_secs() + TTL.get().unwrap();
+        let expire = n.as_secs() + TTL;
         let expire_be = expire.to_be_bytes();
         payload[8..16].copy_from_slice(&expire_be);
     } else {
         return Err(anyhow!("time went backwards 🤷").into());
     }
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET.get().unwrap())?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET)?;
     mac.update(&payload[0..16]);
     let signature = mac.finalize().into_bytes();
     payload[16..48].copy_from_slice(&signature);
@@ -248,7 +186,7 @@ async fn check_ton_proof(
         )));
     }
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET.get().unwrap())?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET)?;
     mac.update(&data[..16]);
     let signature_bytes: [u8; 32] = mac.finalize().into_bytes().into();
     let signature_valid = data
@@ -273,15 +211,15 @@ async fn check_ton_proof(
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     // check ton_proof expiration
-    if now > body.proof.timestamp + TTL.get().unwrap() {
+    if now > body.proof.timestamp + TTL {
         return Err(AppError::BadRequest(anyhow!("ton_proof has been expired")));
     }
 
-    if body.proof.domain.value != *DOMAIN.get().unwrap() {
+    if body.proof.domain.value != DOMAIN {
         return Err(AppError::BadRequest(anyhow!(
             "wrong domain, got {}, expected {}",
             body.proof.domain.value,
-            *DOMAIN.get().unwrap()
+            DOMAIN
         )));
     }
 
@@ -371,7 +309,8 @@ async fn check_ton_proof(
                 .map_err(|_| AppError::BadRequest(anyhow!("invalid code of wallet")))?;
             let version = KNOWN_HASHES
                 .get(&code_hash)
-                .ok_or(AppError::BadRequest(anyhow!("not known wallet version")))?;
+                .ok_or(AppError::BadRequest(anyhow!("not known wallet version")))?
+                .clone();
 
             let pubkey_b = match version {
                 WalletVersion::V1R1
@@ -384,13 +323,13 @@ async fn check_ton_proof(
                     data.public_key
                 }
                 WalletVersion::V3R1 | WalletVersion::V3R2 => {
-                    let data = WalletDataV3::try_from(data)
-                        .map_err(|e| AppError::BadRequest(e.into()))?;
+                    let data =
+                        WalletDataV3::try_from(data).map_err(|e| AppError::BadRequest(e.into()))?;
                     data.public_key
                 }
                 WalletVersion::V4R1 | WalletVersion::V4R2 => {
-                    let data = WalletDataV4::try_from(data)
-                        .map_err(|e| AppError::BadRequest(e.into()))?;
+                    let data =
+                        WalletDataV4::try_from(data).map_err(|e| AppError::BadRequest(e.into()))?;
                     data.public_key
                 }
                 WalletVersion::HighloadV2R2 => {
@@ -419,15 +358,11 @@ async fn check_ton_proof(
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let claims = Claims {
-        exp: now + TTL.get().unwrap(),
+        exp: now + TTL,
         address: body.address.to_base64_std(),
     };
 
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &JWT_KEYS.get().unwrap().encoding,
-    )?;
+    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)?;
 
     Ok(Json(CheckTonProof { token }))
 }
@@ -436,12 +371,6 @@ async fn get_account_info(claims: Claims) -> Result<Json<WalletAddress>, AppErro
     Ok(Json(WalletAddress {
         address: claims.address,
     }))
-}
-
-#[derive(Serialize, Deserialize)]
-struct Claims {
-    exp: u64,
-    address: String,
 }
 
 #[async_trait]
@@ -459,12 +388,9 @@ where
             .map_err(|e| AppError::Unauthorized(e.into()))?;
 
         // Decode the user data
-        let token_data = decode::<Claims>(
-            bearer.token(),
-            &JWT_KEYS.get().unwrap().decoding,
-            &Validation::default(),
-        )
-        .map_err(|e| AppError::Unauthorized(e.into()))?;
+        let token_data =
+            decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
+                .map_err(|e| AppError::Unauthorized(e.into()))?;
 
         let timestamp = token_data.claims.exp;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -474,6 +400,26 @@ where
         }
 
         Ok(token_data.claims)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Claims {
+    exp: u64,
+    address: String,
+}
+
+struct JwtKeys {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+}
+
+impl JwtKeys {
+    pub fn new(secret: &[u8]) -> Self {
+        Self {
+            encoding: EncodingKey::from_secret(secret),
+            decoding: DecodingKey::from_secret(secret),
+        }
     }
 }
 
