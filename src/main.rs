@@ -47,7 +47,7 @@ mod error;
 
 const SHARED_SECRET: &[u8] = "shhhh".as_bytes();
 const DOMAIN: &str = "ton-connect.github.io";
-const TTL: u64 = 3600;
+const TTL: u64 = 3600; // 1 hour
 
 const JWT_KEYS: Lazy<JwtKeys> = Lazy::new(|| JwtKeys::new(SHARED_SECRET));
 const KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
@@ -110,7 +110,6 @@ async fn main() {
         })
     };
 
-    // build our application with a route
     let app = Router::new()
         .route(
             "/ton-proof/generatePayload",
@@ -119,12 +118,6 @@ async fn main() {
         .route("/ton-proof/checkProof", post(check_ton_proof))
         .route("/dapp/getAccountInfo", get(get_account_info))
         .layer(
-            // see https://docs.rs/tower-http/latest/tower_http/cors/index.html
-            // for more details
-            //
-            // pay attention that for some request types like posting content-type: application/json
-            // it is required to add ".allow_headers([http::header::CONTENT_TYPE])"
-            // or see this issue https://github.com/tokio-rs/axum/issues/849
             CorsLayer::new()
                 .allow_origin("http://localhost:3001".parse::<HeaderValue>().unwrap())
                 .allow_headers([AUTHORIZATION, CONTENT_TYPE])
@@ -132,7 +125,6 @@ async fn main() {
         )
         .with_state(contract_factory);
 
-    // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -235,7 +227,7 @@ async fn check_ton_proof(
     let mut msg: Vec<u8> = Vec::new();
     msg.extend_from_slice(TON_PROOF_PREFIX.as_bytes());
     msg.extend_from_slice(&body.address.workchain.to_be_bytes());
-    msg.extend_from_slice(&body.address.hash_part); // should it be big endian?
+    msg.extend_from_slice(&body.address.hash_part);
     msg.extend_from_slice(&(body.proof.domain.length_bytes as u32).to_le_bytes());
     msg.extend_from_slice(body.proof.domain.value.as_bytes());
     msg.extend_from_slice(&body.proof.timestamp.to_le_bytes());
@@ -381,13 +373,11 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Extract the token from the authorization header
         let TypedHeader(Authorization(bearer)) = parts
             .extract::<TypedHeader<Authorization<Bearer>>>()
             .await
             .map_err(|e| AppError::Unauthorized(e.into()))?;
 
-        // Decode the user data
         let token_data =
             decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
                 .map_err(|e| AppError::Unauthorized(e.into()))?;
