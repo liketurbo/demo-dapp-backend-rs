@@ -4,7 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use axum::{
-    extract::{FromRequest, FromRequestParts, Request, State},
+    extract::{FromRequest, FromRequestParts, Request},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         request::Parts,
@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::timeout;
@@ -40,14 +39,15 @@ use tonlib::{
     contract::{TonContractFactory, TonContractInterface},
     wallet::{WalletDataHighloadV2R2, WalletDataV1V2, WalletDataV3, WalletDataV4, WalletVersion},
 };
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 mod dto;
 mod error;
 
 const SHARED_SECRET: &[u8] = "shhhh".as_bytes();
 const DOMAIN: &str = "ton-connect.github.io";
-const TTL: u64 = 3600; // 1 hour
+const PAYLOAD_TTL: u64 = 3600; // 1 hour
+const PROOF_TTL: u64 = 3600; // 1 hour
 
 const JWT_KEYS: Lazy<JwtKeys> = Lazy::new(|| JwtKeys::new(SHARED_SECRET));
 const KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
@@ -83,33 +83,6 @@ const KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
 
 #[tokio::main]
 async fn main() {
-    let contract_factory = {
-        TonClient::set_log_verbosity_level(0);
-        let ton_client_mainnet = TonClient::builder()
-            .with_config(MAINNET_CONFIG)
-            .with_pool_size(10)
-            .build()
-            .await
-            .unwrap();
-        let ton_client_testnet = TonClient::builder()
-            .with_config(TESTNET_CONFIG)
-            .with_pool_size(10)
-            .build()
-            .await
-            .unwrap();
-
-        Arc::new(ContractFactory {
-            mainnet: TonContractFactory::builder(&ton_client_mainnet)
-                .build()
-                .await
-                .unwrap(),
-            testnet: TonContractFactory::builder(&ton_client_testnet)
-                .build()
-                .await
-                .unwrap(),
-        })
-    };
-
     let app = Router::new()
         .route(
             "/ton-proof/generatePayload",
@@ -119,19 +92,13 @@ async fn main() {
         .route("/dapp/getAccountInfo", get(get_account_info))
         .layer(
             CorsLayer::new()
-                .allow_origin("http://localhost:3001".parse::<HeaderValue>().unwrap())
+                .allow_origin(Any)
                 .allow_headers([AUTHORIZATION, CONTENT_TYPE])
                 .allow_methods([Method::GET, Method::POST]),
-        )
-        .with_state(contract_factory);
+        );
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-struct ContractFactory {
-    mainnet: TonContractFactory,
-    testnet: TonContractFactory,
 }
 
 /// Generate ton_proof payload
@@ -148,7 +115,7 @@ async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, A
     rng.fill(&mut payload[0..8]);
 
     if let Ok(n) = SystemTime::now().duration_since(UNIX_EPOCH) {
-        let expire = n.as_secs() + TTL;
+        let expire = n.as_secs() + PAYLOAD_TTL;
         let expire_be = expire.to_be_bytes();
         payload[8..16].copy_from_slice(&expire_be);
     } else {
@@ -166,7 +133,6 @@ async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, A
 }
 
 async fn check_ton_proof(
-    State(contract_factory): State<Arc<ContractFactory>>,
     JsonOrPlain(body): JsonOrPlain<CheckProofPayload>,
 ) -> Result<Json<CheckTonProof>, AppError> {
     let data = hex::decode(body.proof.payload.clone())?;
@@ -181,30 +147,28 @@ async fn check_ton_proof(
     let mut mac = Hmac::<Sha256>::new_from_slice(SHARED_SECRET)?;
     mac.update(&data[..16]);
     let signature_bytes: [u8; 32] = mac.finalize().into_bytes().into();
+
     let signature_valid = data
         .iter()
         .skip(16)
         .zip(signature_bytes.iter().take(16))
         .all(|(a, b)| a == b);
-
     if !signature_valid {
         return Err(AppError::BadRequest(anyhow!("invalid payload signature")));
     }
 
-    let expire_b: [u8; 8] = data[8..16].try_into().expect("already checked length");
-    let expire_d = u64::from_be_bytes(expire_b);
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     // check payload expiration
+    let expire_b: [u8; 8] = data[8..16].try_into().expect("already checked length");
+    let expire_d = u64::from_be_bytes(expire_b);
     if now > expire_d {
         return Err(AppError::BadRequest(anyhow!("payload expired")));
     }
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
-    // check ton_proof expiration
-    if now > body.proof.timestamp + TTL {
-        return Err(AppError::BadRequest(anyhow!("ton_proof has been expired")));
+    // check ton proof expiration
+    if now > body.proof.timestamp + PROOF_TTL {
+        return Err(AppError::BadRequest(anyhow!("ton proof has been expired")));
     }
 
     if body.proof.domain.value != DOMAIN {
@@ -217,15 +181,14 @@ async fn check_ton_proof(
 
     if body.proof.domain.length_bytes != body.proof.domain.value.len() as u64 {
         return Err(AppError::BadRequest(anyhow!(
-            "domain length mismatched against provided length_bytes of {}",
+            "domain length mismatched against provided length bytes of {}",
             body.proof.domain.length_bytes
         )));
     }
 
-    const TON_PROOF_PREFIX: &'static str = "ton-proof-item-v2/";
-
+    let ton_proof_prefix = "ton-proof-item-v2/";
     let mut msg: Vec<u8> = Vec::new();
-    msg.extend_from_slice(TON_PROOF_PREFIX.as_bytes());
+    msg.extend_from_slice(ton_proof_prefix.as_bytes());
     msg.extend_from_slice(&body.address.workchain.to_be_bytes());
     msg.extend_from_slice(&body.address.hash_part);
     msg.extend_from_slice(&(body.proof.domain.length_bytes as u32).to_le_bytes());
@@ -237,23 +200,32 @@ async fn check_ton_proof(
     hasher.update(msg);
     let msg_hash = hasher.finalize();
 
-    const TON_CONNECT_PREFIX: &'static str = "ton-connect";
-
     let mut full_msg: Vec<u8> = vec![0xff, 0xff];
-    full_msg.extend_from_slice(TON_CONNECT_PREFIX.as_bytes());
+    let ton_connect_prefix = "ton-connect";
+    full_msg.extend_from_slice(ton_connect_prefix.as_bytes());
     full_msg.extend_from_slice(&msg_hash);
 
     let mut hasher = Sha256::new();
     hasher.update(full_msg);
     let full_msg_hash = hasher.finalize();
 
-    let contract_factory = match body.network {
-        TonNetwork::Mainnet => &contract_factory.mainnet,
-        TonNetwork::Testnet => &contract_factory.testnet,
+    let client = match body.network {
+        TonNetwork::Mainnet => {
+            TonClient::builder()
+                .with_config(MAINNET_CONFIG)
+                .build()
+                .await?
+        }
+        TonNetwork::Testnet => {
+            TonClient::builder()
+                .with_config(TESTNET_CONFIG)
+                .build()
+                .await?
+        }
     };
 
+    let contract_factory = TonContractFactory::builder(&client).build().await?;
     let wallet_contract = contract_factory.get_contract(&body.address);
-
     let pubkey_bytes = match timeout(
         Duration::from_secs(10),
         wallet_contract.run_get_method("get_public_key", &vec![]),
@@ -330,7 +302,9 @@ async fn check_ton_proof(
                     data.public_key
                 }
                 _ => {
-                    unimplemented!("no generation for that wallet version")
+                    return Err(AppError::BadRequest(anyhow!(
+                        "can't process given wallet version"
+                    )));
                 }
             };
 
@@ -350,10 +324,9 @@ async fn check_ton_proof(
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let claims = Claims {
-        exp: now + TTL,
+        exp: now + PAYLOAD_TTL,
         address: body.address.to_base64_std(),
     };
-
     let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)?;
 
     Ok(Json(CheckTonProof { token }))
@@ -413,7 +386,7 @@ impl JwtKeys {
     }
 }
 
-// To work with [ton-connect/demo-dapp-with-backend example](https://github.com/ton-connect/demo-dapp-with-backend),
+// To work with the [ton-connect/demo-dapp-with-backend example](https://github.com/ton-connect/demo-dapp-with-backend),
 // which sends JSON requests with content-type: text/plain.
 // In a real application, you probably won't need this part.
 struct JsonOrPlain<T>(T);
