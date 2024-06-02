@@ -1,6 +1,6 @@
 # demo-dapp-backend-rs
 
-This backend accompanies the [frontend example](https://github.com/ton-connect/demo-dapp-with-backend).
+This backend accompanies the [frontend example](https://github.com/liketurbo/demo-dapp-with-backend/tree/rs-demo).
 
 ## Authorization Process
 
@@ -9,7 +9,7 @@ This backend accompanies the [frontend example](https://github.com/ton-connect/d
    The client requests a payload to be signed by the wallet:
 
    ```json
-   // <host>/ton-proof/generatePayload
+   // <host>/ton-proof/generate-payload
 
    // Response
    {
@@ -30,7 +30,7 @@ This backend accompanies the [frontend example](https://github.com/ton-connect/d
    The client sends the signed payload to the backend for verification. The backend checks the prefixes and signature, then returns an auth token:
 
    ```json
-   // <host>/ton-proof/checkProof
+   // <host>/ton-proof/check-proof
 
    // Request
    {
@@ -59,7 +59,7 @@ This backend accompanies the [frontend example](https://github.com/ton-connect/d
    The client uses the auth token to access endpoints requiring authentication:
 
    ```json
-   // <host>/dapp/getAccountInfo?network=-239
+   // <host>/dapp/get-account-info?network=-239
    // Bearer <token>
 
    // Response

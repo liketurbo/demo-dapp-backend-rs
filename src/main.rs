@@ -44,7 +44,7 @@ mod dto;
 mod error;
 
 const SHARED_SECRET: &[u8] = "shhhh".as_bytes();
-const DOMAIN: &str = "ton-connect.github.io";
+const DOMAIN: &str = "ton-connect-rs.echohub.ru";
 const PAYLOAD_TTL: u64 = 3600; // 1 hour
 const PROOF_TTL: u64 = 3600; // 1 hour
 
