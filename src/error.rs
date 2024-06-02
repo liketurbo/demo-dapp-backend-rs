@@ -10,7 +10,6 @@ pub enum AppError {
     BadRequest(anyhow::Error),
     ServerError(anyhow::Error),
     Unauthorized(anyhow::Error),
-    UnsupportedMedia(anyhow::Error),
 }
 
 impl IntoResponse for AppError {
@@ -24,10 +23,6 @@ impl IntoResponse for AppError {
             Self::Unauthorized(e) => (
                 StatusCode::UNAUTHORIZED,
                 format!("Authorization error: {}", e),
-            ),
-            Self::UnsupportedMedia(e) => (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                format!("Unsupported media: {}", e),
             ),
         };
 

@@ -4,15 +4,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use axum::{
-    extract::{FromRequest, FromRequestParts, Request},
+    extract::FromRequestParts,
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         request::Parts,
-        HeaderValue, Method,
+        Method,
     },
-    response::{IntoResponse, Response},
     routing::{get, post},
-    Json, RequestExt, RequestPartsExt, Router,
+    Json, RequestPartsExt, Router,
 };
 use axum_extra::{
     headers::{authorization::Bearer, Authorization},
@@ -85,11 +84,11 @@ const KNOWN_HASHES: Lazy<HashMap<[u8; 32], WalletVersion>> = Lazy::new(|| {
 async fn main() {
     let app = Router::new()
         .route(
-            "/ton-proof/generatePayload",
+            "/ton-proof/generate-payload",
             post(generate_ton_proof_payload),
         )
-        .route("/ton-proof/checkProof", post(check_ton_proof))
-        .route("/dapp/getAccountInfo", get(get_account_info))
+        .route("/ton-proof/check-proof", post(check_ton_proof))
+        .route("/dapp/get-account-info", get(get_account_info))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -133,7 +132,7 @@ async fn generate_ton_proof_payload() -> Result<Json<GenerateTonProofPayload>, A
 }
 
 async fn check_ton_proof(
-    JsonOrPlain(body): JsonOrPlain<CheckProofPayload>,
+    Json(body): Json<CheckProofPayload>,
 ) -> Result<Json<CheckTonProof>, AppError> {
     let data = hex::decode(body.proof.payload.clone())?;
 
@@ -383,50 +382,5 @@ impl JwtKeys {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
         }
-    }
-}
-
-// To work with the [ton-connect/demo-dapp-with-backend example](https://github.com/ton-connect/demo-dapp-with-backend),
-// which sends JSON requests with content-type: text/plain.
-// In a real application, you probably won't need this part.
-struct JsonOrPlain<T>(T);
-
-#[async_trait]
-impl<S, T> FromRequest<S> for JsonOrPlain<T>
-where
-    S: Send + Sync,
-    Json<T>: FromRequest<()>,
-    T: 'static,
-{
-    type Rejection = Response;
-
-    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let content_type_header = req.headers().get(CONTENT_TYPE);
-        let content_type = content_type_header.and_then(|value| value.to_str().ok());
-
-        if let Some(content_type) = content_type {
-            if content_type.starts_with("application/json")
-                || content_type.starts_with("text/plain")
-            {
-                if content_type.starts_with("text/plain") {
-                    let content_type = req
-                        .headers_mut()
-                        .get_mut(CONTENT_TYPE)
-                        .expect("checked above");
-                    *content_type = HeaderValue::from_static("application/json");
-                }
-
-                let Json(payload) = req
-                    .extract::<Json<T>, _>()
-                    .await
-                    .map_err(|err| err.into_response())?;
-                return Ok(Self(payload));
-            }
-        }
-
-        Err(
-            AppError::UnsupportedMedia(anyhow!("expected application/json content type"))
-                .into_response(),
-        )
     }
 }
