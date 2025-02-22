@@ -1,6 +1,6 @@
 # demo-dapp-backend-rs
 
-This backend accompanies the [frontend example](https://github.com/liketurbo/demo-dapp-with-backend/tree/rs-demo).
+This backend accompanies the [frontend example](https://github.com/liketurbo/demo-dapp-with-backend).
 
 ## Authorization Process
 
